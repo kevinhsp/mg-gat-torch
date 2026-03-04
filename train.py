@@ -71,7 +71,7 @@ def objective(trial, data_bundle, device):
     final_dim = trial.suggest_categorical("final_dim", [16, 32, 64])
 
     # Suggest continuous hyperparameters (Log-uniform for learning rate)
-    lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
 
     # Suggest graph regularization strength
@@ -339,7 +339,7 @@ if __name__ == '__main__':
     print(f"[Success] Final model weights saved to: {model_save_path}")
     print("=" * 50)
     print("\nTraining complete. Loading the absolute BEST weights for TEST inference...")
-    final_model.load_state_dict(best_final_weights)
+    # final_model.load_state_dict(best_final_weights)
 
     final_test_rmse = evaluate_model(final_model, test_loader, S_u, S_b, eu, eb, final_eval_criterion, device)
 
