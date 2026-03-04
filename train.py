@@ -327,13 +327,11 @@ if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("Saving Best Hyperparameters and Final Model...")
 
-    # 1. 保存最优超参数到 JSON 文件
     hyperparams_path = "best_hyperparameters.json"
     with open(hyperparams_path, "w") as f:
         json.dump(best_params, f, indent=4)
     print(f"[Success] Best hyperparameters saved to: {hyperparams_path}")
 
-    # 2. 保存最终训练好的模型权重到 PTH 文件
     model_save_path = "final_mggat_model.pth"
     torch.save(final_model.state_dict(), model_save_path)
     print(f"[Success] Final model weights saved to: {model_save_path}")
