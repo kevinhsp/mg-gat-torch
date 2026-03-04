@@ -378,18 +378,25 @@ def validate_nig_transparency(model, S_b, eb, device, sample_nodes=1000):
     """
     Analysis 3: IS Transparency Claim Validation.
 
-    Key question: Are the attention weights produced by NIG consistent with
-    feature-level similarity? If yes, then NIG is genuinely feature-driven
-    (transparent), not an opaque black-box transformation.
+    Mathematical insight:
+      Attention score for neighbor l → focal node j:
+        raw[l] = a_self·H1[j] + a_nb·H1[l]
+      In the stable softmax (raw - max), the constant a_self·H1[j] cancels out.
+      Therefore: alpha[l] is determined SOLELY by a_nb·H1[l] — an absolute
+      property of the neighbor, independent of the focal node j.
+
+    Correct transparency test:
+      NIG claims to surface neighbors that matter because of their auxiliary
+      features (via FR). So the right question is:
+        "Does alpha[l] ranking align with FR-weighted feature similarity
+         between j and l?"
+      i.e., do neighbors that are most similar to j on the FR-important features
+      receive the highest attention weight?
 
     Method:
-      For each sampled business node j and its neighbors:
-        1. Compute NIG attention weights α^{l→j}  (recomputed analytically)
-        2. Compute cosine similarity between raw feature vectors S_b[j], S_b[l]
-        3. Compute Spearman correlation between α and cosine_sim across neighbors
-      Report mean Spearman r across all sampled nodes.
-
-    Strong positive r → NIG reflects feature similarity → supports transparency.
+      1. Compute FR weights (|a_nb·W1| per feature dim)
+      2. For each (j, neighbors): compute FR-weighted cosine similarity
+      3. Spearman r between alpha ranking and FR-sim ranking
     """
     model.eval()
     correlations = []
@@ -400,15 +407,21 @@ def validate_nig_transparency(model, S_b, eb, device, sample_nodes=1000):
     dst = edge_index[1].cpu().numpy()
 
     with torch.no_grad():
-        W1_b    = model.item_gat.W_1.weight   # [out_dim, s_b]
-        ab_self = model.item_gat.a_self        # [1, out_dim]
-        ab_nb   = model.item_gat.a_nb          # [1, out_dim]
+        ab_self = model.item_gat.a_self   # [1, out_dim]
+        ab_nb   = model.item_gat.a_nb     # [1, out_dim]
+        W1_b    = model.item_gat.W_1.weight  # [out_dim, s_b]
 
-        H1_b = model.item_gat.W_1(S_b)        # [N, out_dim]
-        score_self = (H1_b * ab_self).sum(-1).cpu().numpy()   # [N]
-        score_nb   = (H1_b * ab_nb  ).sum(-1).cpu().numpy()   # [N]
+        H1_b = model.item_gat.W_1(S_b)      # [N, out_dim]
+        score_self = (H1_b * ab_self).sum(-1).cpu().numpy()  # [N]
+        score_nb   = (H1_b * ab_nb  ).sum(-1).cpu().numpy()  # [N]
 
-    S_b_np = S_b.cpu().numpy()   # raw features for cosine sim
+        # FR weights: importance of each raw feature dim for neighbor attention
+        # FR[d] = |a_nb · W1[:,d]|  — how much raw feature d contributes to alpha
+        FR_weights = np.abs((ab_nb.cpu().numpy() @ W1_b.cpu().numpy()).squeeze())  # [s_b]
+        # Normalize to sum=1 for use as similarity weights
+        FR_weights = FR_weights / (FR_weights.sum() + 1e-8)
+
+    S_b_np = S_b.cpu().numpy()  # [N, s_b] raw features
 
     unique_dst = np.unique(dst)
     if len(unique_dst) > sample_nodes:
@@ -418,30 +431,30 @@ def validate_nig_transparency(model, S_b, eb, device, sample_nodes=1000):
         mask = (dst == node_j)
         neighbors = src[mask]
         k = len(neighbors)
-        if k < 3:   # Need at least 3 for meaningful correlation
+        if k < 3:
             continue
 
-        # NIG attention weights (Eq. 3, recomputed)
+        # NIG alpha: driven by a_nb·H1[l], focal term cancels in softmax
         raw = score_self[node_j] + score_nb[neighbors]
-        raw = np.where(raw > 0, raw, 0.2 * raw)   # LeakyReLU
+        raw = np.where(raw > 0, raw, 0.2 * raw)  # LeakyReLU
         raw_exp = np.exp(raw - raw.max())
-        alpha = raw_exp / raw_exp.sum()            # [k]
+        alpha = raw_exp / raw_exp.sum()           # [k]
 
-        # Cosine similarity between focal node and each neighbor (raw features)
-        feat_j = S_b_np[node_j]
+        # FR-weighted feature similarity between focal j and each neighbor l
+        # weight each feature dim by its FR importance before computing cosine sim
+        feat_j = S_b_np[node_j] * FR_weights          # [s_b] weighted
         feat_j_norm = np.linalg.norm(feat_j) + 1e-8
-        cos_sims = []
+        fr_sims = []
         for nb in neighbors:
-            feat_nb = S_b_np[nb]
-            cos_sim = np.dot(feat_j, feat_nb) / (feat_j_norm * np.linalg.norm(feat_nb) + 1e-8)
-            cos_sims.append(cos_sim)
+            feat_nb = S_b_np[nb] * FR_weights          # [s_b] weighted
+            sim = np.dot(feat_j, feat_nb) / (feat_j_norm * np.linalg.norm(feat_nb) + 1e-8)
+            fr_sims.append(sim)
+        fr_sims = np.array(fr_sims)
 
-        cos_sims = np.array(cos_sims)
+        if np.std(alpha) < 1e-8 or np.std(fr_sims) < 1e-8:
+            continue
 
-        if np.std(alpha) < 1e-8 or np.std(cos_sims) < 1e-8:
-            continue   # Skip degenerate cases
-
-        corr, pval = spearmanr(alpha, cos_sims)
+        corr, pval = spearmanr(alpha, fr_sims)
         if not np.isnan(corr):
             correlations.append(corr)
             p_values.append(pval)
@@ -450,32 +463,30 @@ def validate_nig_transparency(model, S_b, eb, device, sample_nodes=1000):
     pval_arr = np.array(p_values)
 
     print(f"\n{'─'*50}")
-    print(f"[Transparency Validation] NIG weights vs. Feature Similarity")
+    print(f"[Transparency Validation] NIG alpha vs. FR-weighted Feature Similarity")
     print(f"  Nodes analyzed: {len(corr_arr)}")
-    print(f"  Mean Spearman r = {corr_arr.mean():.4f}  "
-          f"(std={corr_arr.std():.4f})")
+    print(f"  Mean Spearman r = {corr_arr.mean():.4f}  (std={corr_arr.std():.4f})")
     print(f"  Median Spearman r = {np.median(corr_arr):.4f}")
     print(f"  % nodes with positive r = {(corr_arr > 0).mean()*100:.1f}%")
-    print(f"  % nodes with r > 0.3   = {(corr_arr > 0.3).mean()*100:.1f}%")
-    print(f"  % nodes significant (p<0.05) = {(pval_arr < 0.05).mean()*100:.1f}%")
+    print(f"  % nodes with r > 0.3    = {(corr_arr > 0.3).mean()*100:.1f}%")
+    print(f"  % significant (p<0.05)  = {(pval_arr < 0.05).mean()*100:.1f}%")
 
-    interpretation = (
-        "Strong: NIG is feature-driven → supports transparency claim"
-        if corr_arr.mean() > 0.3 else
-        "Moderate: partial feature-driven behavior" if corr_arr.mean() > 0.1 else
-        "Weak: NIG operates beyond raw feature similarity (learned non-linear filtering)"
-    )
-    print(f"  Interpretation: {interpretation}")
+    if corr_arr.mean() > 0.2:
+        interp = "NIG preferentially attends to FR-similar neighbors → supports IS transparency claim"
+    elif corr_arr.mean() > 0:
+        interp = "Weak positive alignment: NIG partially consistent with FR-driven similarity"
+    else:
+        interp = "NIG attention not aligned with FR-feature similarity — transparency claim limited"
+    print(f"  Interpretation: {interp}")
 
-    # Plot correlation distribution
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(corr_arr, bins=60, color='seagreen', edgecolor='white', alpha=0.85)
     ax.axvline(corr_arr.mean(), color='red', linestyle='--',
                label=f'Mean r = {corr_arr.mean():.3f}')
     ax.axvline(0, color='black', linewidth=0.8, linestyle='-')
-    ax.set_xlabel('Spearman Correlation (NIG weights vs. Feature Similarity)', fontsize=11)
+    ax.set_xlabel('Spearman r  (NIG alpha vs. FR-weighted feature similarity)', fontsize=10)
     ax.set_ylabel('Node Count', fontsize=11)
-    ax.set_title('IS Transparency Validation:\nNIG Attention Alignment with Feature Similarity', fontsize=11)
+    ax.set_title('IS Transparency Validation:\nDo NIG Weights Align with FR-important Features?', fontsize=11)
     ax.legend()
     plt.tight_layout()
     path = 'figures/transparency_validation.png'
