@@ -21,6 +21,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib
+
+from train import evaluate_model
+
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 from scipy.stats import spearmanr
 from torch_geometric.utils import softmax
@@ -34,31 +37,44 @@ from models import MGGATRecommender
 # ─────────────────────────────────────────────
 
 def load_trained_model(model_path, hyperparams_path, device):
-    """Load the saved trained model from disk."""
-    with open(hyperparams_path, 'r') as f:
+    with open(hyperparams_path, "r") as f:
         params = json.load(f)
 
-    S_u, S_b, eu, eb, train_ds, tune_ds, test_ds = load_mggat_data()
-    num_users, u_in_dim = S_u.shape
-    num_items, i_in_dim = S_b.shape
+    S_u_exp, S_b_exp, eu, eb, train_ds, tune_ds, test_ds, train_df = load_mggat_data()
 
+    checkpoint = torch.load(model_path, map_location=device)
+    S_u_imp = checkpoint["S_u_imp"].to(device)
+    S_b_imp = checkpoint["S_b_imp"].to(device)
+
+    S_u = torch.cat([S_u_exp.to(device), S_u_imp], dim=1)
+    S_b = torch.cat([S_b_exp.to(device), S_b_imp], dim=1)
+
+    eu = [e.to(device) for e in eu]
+    eb = [e.to(device) for e in eb]
+
+    num_users = S_u.shape[0]
+    num_items = S_b.shape[0]
+
+    num_i_graphs = checkpoint.get("num_i_graphs")
+    num_u_graphs = checkpoint.get("num_u_graphs")
+    print("num_i_graphs", num_i_graphs)
+    print("num_u_graphs", num_u_graphs)
     model = MGGATRecommender(
-        num_users=num_users,
-        num_items=num_items,
-        u_in_dim=u_in_dim,
-        i_in_dim=i_in_dim,
-        latent_dim=params['latent_dim'],
-        final_dim=params['final_dim'],
-        num_u_graphs=len(eu),
-        num_i_graphs=len(eb)
+        num_users=num_users, num_items=num_items,
+        u_in_dim=S_u.shape[1], i_in_dim=S_b.shape[1],
+        latent_dim=params["latent_dim"], final_dim=params["final_dim"],
+        num_u_graphs=num_u_graphs, num_i_graphs=num_i_graphs,
+        actv_in_name=params.get("activation_in"),
+        actv_out_name=params.get("activation_out")
     ).to(device)
 
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+
     print(f"Model loaded from {model_path}")
-    return model, S_u.to(device), S_b.to(device), \
-           [e.to(device) for e in eu], [e.to(device) for e in eb], \
-           train_ds, tune_ds, test_ds
+    print(f"Params: {params}")
+
+    return model, S_u, S_b, eu, eb, train_ds, tune_ds, test_ds, params
 
 
 def compute_gini(weights: np.ndarray) -> float:
@@ -156,8 +172,7 @@ def analyze_nig_sparsity(model, S_u, S_b, eu, eb, device,
         print(f"[NIG Sparsity] {side} side  (n_nodes = {len(gini_arr)})")
         print(f"  Gini coefficient:  mean={gini_arr.mean():.4f}  median={np.median(gini_arr):.4f}")
         print(f"  Top-1 weight share: {top1_arr.mean():.4f}  vs. uniform={uniform_top1:.4f}")
-        print(f"  Top-3 weight share: {top3_shares_mean:.4f}" if False else
-              f"  Top-3 weight share: {np.mean(top3_shares):.4f}")
+        print(f"  Top-3 weight share: {np.mean(top3_shares):.4f}")
         print(f"  NIG selectivity ratio (top-1 / uniform): {top1_arr.mean()/uniform_top1:.2f}x")
 
         results[side] = {
@@ -570,13 +585,6 @@ def explain_one_recommendation(model, user_id, item_id,
         direction = 'positive' if (FR_focal_b + FR_neighbor_b)[i] > 0 else 'negative'
         print(f"  #{rank+1}  {feature_names_biz[i]:<40s}  FR={FR_combined[i]:.4f}  ({direction})")
 
-    print(f"\n[IS Transparency] Plain-language explanation:")
-    if len(top_nb_ids) > 0:
-        print(f"  Business {item_id} is recommended because it is most similar to")
-        print(f"  Business {top_nb_ids[0]} (weight={top_nb_weights[0]:.3f}).")
-    print(f"  The similarity is primarily driven by: "
-          + ", ".join([feature_names_biz[i] for i in top_fr_idx[:3]]))
-    print('='*60)
 
 
 # ─────────────────────────────────────────────
@@ -639,112 +647,53 @@ def ablation_nig_vs_uniform(model, test_loader, S_u, S_b, eu, eb, device):
     return rmse_nig, rmse_uniform
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+def ablation_component_contribution(model, test_loader, S_u, S_b, eu, eb, device):
+    from math import sqrt
 
-if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    def rmse_with_zeroing(zero_gat_u=False, zero_gat_b=False,
+                          zero_svd_u=False, zero_svd_b=False):
+        orig_hu4 = model.H_u_4.weight.data.clone()
+        orig_hb4 = model.H_b_4.weight.data.clone()
 
-    os.makedirs("figures", exist_ok=True)
+        if zero_svd_u: model.H_u_4.weight.data.zero_()
+        if zero_svd_b: model.H_b_4.weight.data.zero_()
 
-    # ── Load trained model ──
-    model, S_u, S_b, eu, eb, train_ds, tune_ds, test_ds = load_trained_model(
-        model_path='final_mggat_model.pth',
-        hyperparams_path='best_hyperparameters.json',
-        device=device
-    )
-    test_loader = DataLoader(test_ds, batch_size=2048, shuffle=False)
+        hooks = []
+        if zero_gat_u:
+            hooks.append(model.user_gat.register_forward_hook(
+                lambda m, inp, out: torch.zeros_like(out)
+            ))
+        if zero_gat_b:
+            hooks.append(model.item_gat.register_forward_hook(
+                lambda m, inp, out: torch.zeros_like(out)
+            ))
 
-    # ── Load feature names (adjust path to your actual CSV columns) ──
-    df_user_feat = pd.read_csv('dataset/PA/user_features.csv')
-    df_item_feat = pd.read_csv('dataset/PA/item_features.csv')
-    feature_names_user = list(df_user_feat.columns)
-    feature_names_biz  = list(df_item_feat.columns)
+        eval_criterion = nn.MSELoss(reduction='sum')
+        rmse = evaluate_model(model, test_loader, S_u, S_b, eu, eb, eval_criterion, device)
 
-    print(f"\nUser features: {len(feature_names_user)}")
-    print(f"Business features: {len(feature_names_biz)}")
+        for h in hooks: h.remove()
+        model.H_u_4.weight.data = orig_hu4
+        model.H_b_4.weight.data = orig_hb4
 
-    # ══════════════════════════════════════
-    # ANALYSIS 1: NIG Sparsity
-    # ══════════════════════════════════════
-    print("\n" + "="*60)
-    print("ANALYSIS 1: NIG Sparsity")
-    print("="*60)
-    nig_results = analyze_nig_sparsity(
-        model, S_u, S_b, eu, eb, device,
-        num_samples=2000, output_dir="figures"
-    )
+        return rmse
 
-    # ══════════════════════════════════════
-    # ANALYSIS 2: Feature Relevance
-    # ══════════════════════════════════════
-    print("\n" + "="*60)
-    print("ANALYSIS 2: Feature Relevance (FR)")
-    print("="*60)
-    all_fr = extract_and_plot_fr(
-        model,
-        feature_names_user=feature_names_user,
-        feature_names_biz=feature_names_biz,
-        top_k=20, output_dir="figures"
-    )
+    results = {
+        "Full model": rmse_with_zeroing(),
+        "Zero user SVD (H_u_4)": rmse_with_zeroing(zero_svd_u=True),
+        "Zero item SVD (H_b_4)": rmse_with_zeroing(zero_svd_b=True),
+        "Zero user GAT": rmse_with_zeroing(zero_gat_u=True),
+        "Zero item GAT": rmse_with_zeroing(zero_gat_b=True),
+        "Zero all SVD": rmse_with_zeroing(zero_svd_u=True, zero_svd_b=True),
+        "Zero all GAT": rmse_with_zeroing(zero_gat_u=True, zero_gat_b=True),
+    }
 
-    # ══════════════════════════════════════
-    # ANALYSIS 3: Transparency Validation
-    # ══════════════════════════════════════
-    print("\n" + "="*60)
-    print("ANALYSIS 3: Transparency Validation (IS Claim)")
-    print("="*60)
-    corr_arr = validate_nig_transparency(
-        model, S_b, eb, device, sample_nodes=1000
-    )
+    print(f"\n{'─' * 55}")
+    print(f"[Ablation: Component Contribution]")
+    baseline = results["Full model"]
+    for name, rmse in results.items():
+        delta = rmse - baseline
+        print(f"  {name:<30s}  RMSE={rmse:.4f}  Δ={delta:+.4f}")
 
-    # ══════════════════════════════════════
-    # ANALYSIS 4: Case Study
-    # ══════════════════════════════════════
-    print("\n" + "="*60)
-    print("ANALYSIS 4: Case Study (Qualitative Explanation)")
-    print("="*60)
-    # Use user 0, item 0 as example — replace with a real high-rated pair
-    explain_one_recommendation(
-        model, user_id=0, item_id=0,
-        S_u=S_u, S_b=S_b, eu=eu, eb=eb,
-        feature_names_user=feature_names_user,
-        feature_names_biz=feature_names_biz,
-        device=device
-    )
+    return results
 
-    # ══════════════════════════════════════
-    # ANALYSIS 5: Ablation (NIG vs Uniform)
-    # ══════════════════════════════════════
-    print("\n" + "="*60)
-    print("ANALYSIS 5: Ablation — NIG vs Uniform Attention")
-    print("="*60)
-    ablation_nig_vs_uniform(model, test_loader, S_u, S_b, eu, eb, device)
 
-    # ── Summary for report ──
-    print("\n" + "="*60)
-    print("SUMMARY FOR REPORT")
-    print("="*60)
-    u_gini = nig_results['User']['gini'].mean()
-    b_gini = nig_results['Business']['gini'].mean()
-    u_top1 = nig_results['User']['top1'].mean()
-    b_top1 = nig_results['Business']['top1'].mean()
-    u_unif = nig_results['User']['uniform_top1']
-    b_unif = nig_results['Business']['uniform_top1']
-    mean_r = corr_arr.mean()
-
-    print(f"1. NIG Sparsity (User):      Gini={u_gini:.3f}, Top-1={u_top1:.3f} vs Uniform={u_unif:.3f}")
-    print(f"   NIG Sparsity (Business):  Gini={b_gini:.3f}, Top-1={b_top1:.3f} vs Uniform={b_unif:.3f}")
-    print(f"2. Transparency r (Business side): {mean_r:.3f}")
-    print(f"3. Figures saved in ./figures/")
-    print(f"\nReport interpretation:")
-    if u_gini > 0.3 and b_gini > 0.3:
-        print("  ✓ NIG exhibits significant sparsity — selective neighbor filtering confirmed")
-    else:
-        print("  △ NIG sparsity is moderate — discuss trade-off in report")
-    if mean_r > 0.1:
-        print("  ✓ NIG is positively correlated with feature similarity — supports transparency")
-    else:
-        print("  △ NIG learns beyond raw features — model captures latent structure")

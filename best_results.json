@@ -1,0 +1,19 @@
+{
+    "test_rmse": 1.3240645140779363,
+    "spearman": 0.31247054294561283,
+    "fcp": 0.6614791182846202,
+    "BPR": 0.5403,
+    "valid_ratio": 0.21271411695215595,
+    "tune_rmse": 1.2994888361974288,
+    "trial_number": 178,
+    "params": {
+        "latent_dim": 61,
+        "final_dim": 81,
+        "lr": 0.00048455983301301704,
+        "weight_decay": 0.0020783731536803234,
+        "theta_1": 0.007568749976674576,
+        "activation_in": "relu",
+        "activation_out": "tanh",
+        "implicit_dim": 4
+    }
+}

@@ -1,7 +1,10 @@
 {
-    "latent_dim": 64,
-    "final_dim": 64,
-    "lr": 0.0008952957510773724,
-    "weight_decay": 0.00030918767666094645,
-    "theta_1": 0.13098356566274738
+    "latent_dim": 61,
+    "final_dim": 81,
+    "lr": 0.00048455983301301704,
+    "weight_decay": 0.0020783731536803234,
+    "theta_1": 0.007568749976674576,
+    "activation_in": "relu",
+    "activation_out": "tanh",
+    "implicit_dim": 4
 }
